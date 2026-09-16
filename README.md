@@ -31,8 +31,8 @@ python -m video_fetcher 'https://v.douyin.com/xxxx/'
 
 | site | 状态 |
 | --- | --- |
-| `douyin` | 已实现（输出目录含固定名 `manifest.json`；稀疏返回回退齐全） |
-| `youtube` | 未实现 |
-| `weixin` | 未实现 |
+| `douyin` | 已实现（`manifest.json`；稀疏返回回退齐全） |
+| `youtube` | 已实现（最高 quality；分离音视频则 ffmpeg 合并；字幕语言精确/主语言码回退） |
+| `weixin` | 已实现（`resource_url` + 封面；目录 id 取自 `post_url`） |
 
 项目规范与设计见配套 brain：`video-fetcher-brain`。
