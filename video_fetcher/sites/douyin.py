@@ -30,16 +30,7 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     if video_media is None:
         raise ValueError("抖音结果中未找到 media_type=video 的项。")
 
-    variant, pick_reason = _pick_video_variant(video_media)
-    video_url = variant.get("video_url")
-    if not isinstance(video_url, str) or not video_url:
-        raise ValueError(f"所选变体缺少 video_url（{pick_reason}）。")
-    video_ext = variant.get("video_ext")
-    if not isinstance(video_ext, str) or not video_ext:
-        raise ValueError(f"所选变体缺少 video_ext（{pick_reason}）。")
-    video_filesize = variant.get("video_filesize")
-    if video_filesize is None:
-        raise ValueError(f"所选变体缺少 video_filesize（{pick_reason}）。")
+    video_url, video_ext, video_filesize, pick_reason = _resolve_video_source(video_media)
 
     preview_url = video_media.get("preview_url")
     if not isinstance(preview_url, str) or not preview_url:
@@ -57,12 +48,13 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     cover_path = out / cover_name
     info_path = out / info_name
 
-    # 视频：失败重试 3 次后抛错中止（核心产物）
+    # 视频：失败重试 3 次后抛错中止（核心产物）；无 filesize 时跳过字节校验
+    expected = int(video_filesize) if video_filesize is not None else None
     download_file(
         video_url,
         video_path,
         headers=headers,
-        expected_size=int(video_filesize),
+        expected_size=expected,
     )
 
     # 封面：失败则记录进 md，不阻断主流程
@@ -91,15 +83,44 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     return out
 
 
-def _pick_video_variant(video_media: dict[str, Any]) -> tuple[dict[str, Any], str]:
-    """优先 Original；不存在则取 quality 数值最高的变体。"""
+def _resolve_video_source(
+    video_media: dict[str, Any],
+) -> tuple[str, str, int | None, str]:
+    """返回 (video_url, video_ext, video_filesize|None, pick_reason)。
+
+    优先级：Original 变体 → quality 最高变体 → resource_url。
+    """
     variants = video_media.get("variants")
-    if not isinstance(variants, list) or not variants:
-        raise ValueError(
-            "抖音 video 媒体缺少 variants；无法选取下载画质。"
-            "（若该帖只有 resource_url 而无 variants，需迭代规则。）"
+    if isinstance(variants, list) and variants:
+        variant, pick_reason = _pick_video_variant(variants)
+        video_url = variant.get("video_url")
+        if not isinstance(video_url, str) or not video_url:
+            raise ValueError(f"所选变体缺少 video_url（{pick_reason}）。")
+        video_ext = variant.get("video_ext")
+        if not isinstance(video_ext, str) or not video_ext.strip():
+            raise ValueError(f"所选变体缺少 video_ext（{pick_reason}）。")
+        filesize_raw = variant.get("video_filesize")
+        if filesize_raw is None:
+            raise ValueError(f"所选变体缺少 video_filesize（{pick_reason}）。")
+        return video_url, video_ext.strip(), int(filesize_raw), pick_reason
+
+    resource_url = video_media.get("resource_url")
+    if isinstance(resource_url, str) and resource_url.strip():
+        ext = extension_from_url(resource_url, default="mp4")
+        return (
+            resource_url.strip(),
+            ext,
+            None,
+            "无 variants，回退 resource_url（跳过 filesize 校验）",
         )
 
+    raise ValueError(
+        "抖音 video 媒体既无可用 variants，也无 resource_url，无法下载视频。"
+    )
+
+
+def _pick_video_variant(variants: list[Any]) -> tuple[dict[str, Any], str]:
+    """优先 Original；不存在则取 quality 数值最高的变体。"""
     dict_variants = [v for v in variants if isinstance(v, dict)]
     if not dict_variants:
         raise ValueError("抖音 variants 中没有任何对象项。")
