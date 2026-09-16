@@ -30,16 +30,16 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     if video_media is None:
         raise ValueError("抖音结果中未找到 media_type=video 的项。")
 
-    variant = _pick_original_variant(video_media)
+    variant, pick_reason = _pick_video_variant(video_media)
     video_url = variant.get("video_url")
     if not isinstance(video_url, str) or not video_url:
-        raise ValueError("Original 变体缺少 video_url。")
+        raise ValueError(f"所选变体缺少 video_url（{pick_reason}）。")
     video_ext = variant.get("video_ext")
     if not isinstance(video_ext, str) or not video_ext:
-        raise ValueError("Original 变体缺少 video_ext。")
+        raise ValueError(f"所选变体缺少 video_ext（{pick_reason}）。")
     video_filesize = variant.get("video_filesize")
     if video_filesize is None:
-        raise ValueError("Original 变体缺少 video_filesize。")
+        raise ValueError(f"所选变体缺少 video_filesize（{pick_reason}）。")
 
     preview_url = video_media.get("preview_url")
     if not isinstance(preview_url, str) or not preview_url:
@@ -91,30 +91,54 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     return out
 
 
-def _pick_original_variant(video_media: dict[str, Any]) -> dict[str, Any]:
+def _pick_video_variant(video_media: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """优先 Original；不存在则取 quality 数值最高的变体。"""
     variants = video_media.get("variants")
     if not isinstance(variants, list) or not variants:
         raise ValueError(
-            "抖音 video 媒体缺少 variants；无法按 quality_label=Original 选取。"
-            "（若该帖只有 resource_url 而无 Original 变体，需迭代规则。）"
+            "抖音 video 媒体缺少 variants；无法选取下载画质。"
+            "（若该帖只有 resource_url 而无 variants，需迭代规则。）"
         )
 
-    for item in variants:
-        if not isinstance(item, dict):
-            continue
+    dict_variants = [v for v in variants if isinstance(v, dict)]
+    if not dict_variants:
+        raise ValueError("抖音 variants 中没有任何对象项。")
+
+    for item in dict_variants:
         label = item.get("quality_label")
         if isinstance(label, str) and label.strip().lower() in _ORIGINAL_LABELS:
-            return item
+            return item, f"quality_label={label!r}"
 
-    labels = [
-        v.get("quality_label")
-        for v in variants
-        if isinstance(v, dict)
-    ]
-    raise ValueError(
-        "未找到 quality_label 为 Original 的变体。"
-        f"现有 quality_label={labels!r}"
+    def quality_key(item: dict[str, Any]) -> int:
+        raw = item.get("quality")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return -1
+
+    best = max(dict_variants, key=quality_key)
+    if quality_key(best) < 0:
+        raise ValueError(
+            "无 Original 变体，且所有变体都缺少可用的 quality 数值，无法回退选取。"
+            f"variants 摘要={_variants_summary(dict_variants)!r}"
+        )
+    label = best.get("quality_label")
+    return (
+        best,
+        f"无 Original，回退 quality 最高："
+        f"quality={best.get('quality')!r}, quality_label={label!r}",
     )
+
+
+def _variants_summary(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "quality": v.get("quality"),
+            "quality_label": v.get("quality_label"),
+            "has_video_url": bool(v.get("video_url")),
+        }
+        for v in variants
+    ]
 
 
 def _format_beijing_time(raw: Any) -> str:
