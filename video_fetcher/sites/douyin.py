@@ -7,8 +7,7 @@ from video_fetcher.config import Settings
 from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.manifest import build_manifest, write_manifest
 from video_fetcher.paths import extension_from_url, id_from_post_url, post_dir
-
-_ORIGINAL_LABELS = {"original", "origianl"}  # 含设想稿中的拼写
+from video_fetcher.quality import pick_variant_by_quality
 
 
 def download_post(post: dict[str, Any], settings: Settings) -> Path:
@@ -118,13 +117,13 @@ def _resolve_video_source(
 ) -> tuple[str, str, int | None, str]:
     """返回 (video_url, video_ext, video_filesize|None, pick_reason)。
 
-    优先级：Original → 最高 quality → resource_url。
+    优先级：按 ≤1080 最大 / >1080 最小选 variants → resource_url。
     变体缺 ext / filesize 时软回退；变体不可用时再回退 resource_url。
     """
     variants = video_media.get("variants")
     if isinstance(variants, list) and variants:
         try:
-            variant, pick_reason = _pick_video_variant(variants)
+            variant, pick_reason = pick_variant_by_quality(variants)
         except ValueError as exc:
             resource = _resource_url_fallback(video_media, why=f"variants 不可用（{exc}）")
             if resource is not None:
@@ -181,49 +180,6 @@ def _resource_url_fallback(
         None,
         f"{why}，回退 resource_url（跳过 filesize 校验）",
     )
-
-
-def _pick_video_variant(variants: list[Any]) -> tuple[dict[str, Any], str]:
-    """优先 Original；不存在则取 quality 数值最高的变体。"""
-    dict_variants = [v for v in variants if isinstance(v, dict)]
-    if not dict_variants:
-        raise ValueError("variants 中没有任何对象项")
-
-    for item in dict_variants:
-        label = item.get("quality_label")
-        if isinstance(label, str) and label.strip().lower() in _ORIGINAL_LABELS:
-            return item, f"quality_label={label!r}"
-
-    def quality_key(item: dict[str, Any]) -> int:
-        raw = item.get("quality")
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return -1
-
-    best = max(dict_variants, key=quality_key)
-    if quality_key(best) < 0:
-        raise ValueError(
-            "无 Original 且无可用 quality；"
-            f"摘要={_variants_summary(dict_variants)!r}"
-        )
-    label = best.get("quality_label")
-    return (
-        best,
-        f"无 Original，回退 quality 最高："
-        f"quality={best.get('quality')!r}, quality_label={label!r}",
-    )
-
-
-def _variants_summary(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "quality": v.get("quality"),
-            "quality_label": v.get("quality_label"),
-            "has_video_url": bool(v.get("video_url")),
-        }
-        for v in variants
-    ]
 
 
 def _require_str(data: dict[str, Any], key: str) -> str:

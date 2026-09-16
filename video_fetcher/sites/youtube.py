@@ -8,6 +8,7 @@ from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.ffmpeg_merge import merge_av_copy
 from video_fetcher.manifest import build_manifest, write_manifest
 from video_fetcher.paths import extension_from_url, post_dir
+from video_fetcher.quality import pick_variant_by_quality
 
 
 def download_post(post: dict[str, Any], settings: Settings) -> Path:
@@ -26,7 +27,7 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     if video_media is None:
         raise ValueError("YouTube 结果中未找到 media_type=video 的项。")
 
-    variant = _pick_max_quality_variant(video_media)
+    variant = _pick_video_variant(video_media)
     video_url = variant.get("video_url")
     if not isinstance(video_url, str) or not video_url.strip():
         raise ValueError(
@@ -161,28 +162,15 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     return out
 
 
-def _pick_max_quality_variant(video_media: dict[str, Any]) -> dict[str, Any]:
+def _pick_video_variant(video_media: dict[str, Any]) -> dict[str, Any]:
     variants = video_media.get("variants")
     if not isinstance(variants, list) or not variants:
         raise ValueError("YouTube video 媒体缺少 variants，无法按 quality 选取。")
-    dict_variants = [v for v in variants if isinstance(v, dict)]
-    if not dict_variants:
-        raise ValueError("YouTube variants 中没有任何对象项。")
-
-    def quality_key(item: dict[str, Any]) -> int:
-        raw = item.get("quality")
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return -1
-
-    best = max(dict_variants, key=quality_key)
-    if quality_key(best) < 0:
-        raise ValueError(
-            "YouTube variants 均缺少可用 quality 数值。"
-            f"摘要={[ {'quality': v.get('quality'), 'label': v.get('quality_label')} for v in dict_variants ]!r}"
-        )
-    return best
+    try:
+        variant, _reason = pick_variant_by_quality(variants)
+    except ValueError as exc:
+        raise ValueError(f"YouTube 变体选取失败：{exc}") from exc
+    return variant
 
 
 def _resolve_srt_url(
