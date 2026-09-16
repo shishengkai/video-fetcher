@@ -29,14 +29,10 @@ def download_post(post: SnapAnyPost, settings: Settings) -> Path:
             "本站不使用 variants.video_url（分片流实测不可靠）。"
         )
     resource_url = resource_url.strip()
-
-    if not video_media.headers:
-        raise ValueError(
-            "Bilibili video 媒体缺少 headers（通常需 User-Agent 与 Referer），无法下载。"
-        )
+    # 有 headers 则带上；实测部分直链在浏览器无 Referer 也可下，故不强制
+    headers = video_media.headers or None
 
     video_ext = extension_from_url(resource_url, default="mp4")
-    headers = video_media.headers
 
     out = post_dir(settings, site, post_id)
     video_name = f"{site}-{post_id}.{video_ext}"
