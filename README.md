@@ -31,7 +31,7 @@ python -m video_fetcher 'https://v.douyin.com/xxxx/'
 
 | site | 状态 |
 | --- | --- |
-| `douyin` | 已实现（Original → 最高 quality → resource_url；封面 + 信息 md） |
+| `douyin` | 已实现（含稀疏返回回退：id←post_url、Original→最高 quality→resource_url、封面可跳过） |
 | `youtube` | 未实现 |
 | `weixin` | 未实现 |
 
