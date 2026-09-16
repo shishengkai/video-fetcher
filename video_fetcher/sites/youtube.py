@@ -8,7 +8,7 @@ from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.ffmpeg_merge import merge_av_copy
 from video_fetcher.manifest import build_manifest, write_manifest
 from video_fetcher.paths import extension_from_url, post_dir
-from video_fetcher.quality import pick_variant_by_quality
+from video_fetcher.quality import pick_audio_variant, pick_variant_by_quality
 
 
 def download_post(post: dict[str, Any], settings: Settings) -> Path:
@@ -45,9 +45,11 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     video_filesize = variant.get("video_filesize")
     expected_video = int(video_filesize) if video_filesize is not None else None
 
-    audio_url_raw = variant.get("audio_url")
-    has_separate_audio = isinstance(audio_url_raw, str) and bool(audio_url_raw.strip())
-    audio_url = audio_url_raw.strip() if has_separate_audio else None
+    audio_pick = _resolve_separate_audio(post=post, video_variant=variant)
+    has_separate_audio = audio_pick is not None
+    audio_url = audio_pick[0] if audio_pick else None
+    audio_ext = audio_pick[1] if audio_pick else None
+    expected_audio = audio_pick[2] if audio_pick else None
 
     headers = video_media.get("headers") if isinstance(video_media.get("headers"), dict) else {}
 
@@ -67,14 +69,7 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     ]
 
     audio_path: Path | None = None
-    if has_separate_audio and audio_url is not None:
-        audio_ext = variant.get("audio_ext")
-        if not isinstance(audio_ext, str) or not audio_ext.strip():
-            audio_ext = extension_from_url(audio_url, default="m4a")
-        else:
-            audio_ext = audio_ext.strip()
-        audio_filesize = variant.get("audio_filesize")
-        expected_audio = int(audio_filesize) if audio_filesize is not None else None
+    if has_separate_audio and audio_url is not None and audio_ext is not None:
         audio_path = out / f"{site}-{post_id}.{audio_ext}"
         jobs.append(
             DownloadJob(
@@ -169,8 +164,54 @@ def _pick_video_variant(video_media: dict[str, Any]) -> dict[str, Any]:
     try:
         variant, _reason = pick_variant_by_quality(variants)
     except ValueError as exc:
-        raise ValueError(f"YouTube 变体选取失败：{exc}") from exc
+        raise ValueError(f"YouTube 视频变体选取失败：{exc}") from exc
     return variant
+
+
+def _resolve_separate_audio(
+    *,
+    post: dict[str, Any],
+    video_variant: dict[str, Any],
+) -> tuple[str, str, int | None] | None:
+    """独立音频：优先 Original；无则回退。无独立轨则返回 None（合成流）。
+
+    返回 (audio_url, audio_ext, expected_filesize|None)。
+    """
+    medias = post.get("medias")
+    if isinstance(medias, list):
+        audio_media = next(
+            (m for m in medias if isinstance(m, dict) and m.get("media_type") == "audio"),
+            None,
+        )
+        if audio_media is not None:
+            variants = audio_media.get("variants")
+            if isinstance(variants, list) and variants:
+                try:
+                    picked, _reason = pick_audio_variant(variants)
+                except ValueError:
+                    picked = None
+                if picked is not None:
+                    return _audio_fields_from_variant(picked)
+
+    # 无可用 audio 媒体时：回退到所选视频变体上的 audio_url（若有）
+    return _audio_fields_from_variant(video_variant)
+
+
+def _audio_fields_from_variant(
+    variant: dict[str, Any],
+) -> tuple[str, str, int | None] | None:
+    audio_url = variant.get("audio_url")
+    if not isinstance(audio_url, str) or not audio_url.strip():
+        return None
+    audio_url = audio_url.strip()
+    audio_ext = variant.get("audio_ext")
+    if not isinstance(audio_ext, str) or not audio_ext.strip():
+        audio_ext = extension_from_url(audio_url, default="m4a")
+    else:
+        audio_ext = audio_ext.strip()
+    filesize_raw = variant.get("audio_filesize")
+    expected = int(filesize_raw) if filesize_raw is not None else None
+    return audio_url, audio_ext, expected
 
 
 def _resolve_srt_url(
