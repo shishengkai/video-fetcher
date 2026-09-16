@@ -38,5 +38,6 @@ python -m video_fetcher 'https://v.douyin.com/xxxx/'
 | `douyin` | 已实现（`manifest.json`；视频 ≤1080 最大 / 否则 >1080 最小；稀疏返回回退；同帖媒体并行下载） |
 | `youtube` | 已实现（视频 ≤1080；音频优先 Original 再回退；同帖媒体并行下载；分离轨则 ffmpeg 合并；字幕语言回退） |
 | `weixin` | 已实现（`resource_url` + 封面；目录 id 取自 `post_url`；同帖媒体并行下载） |
+| `bilibili` | 已实现（仅 `resource_url`；BV id 取自 `post_url` 末节并写入 manifest；须带 headers；同帖并行） |
 
 项目规范与设计见配套 brain：`video-fetcher-brain`。

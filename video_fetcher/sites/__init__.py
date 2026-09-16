@@ -5,11 +5,12 @@ from pathlib import Path
 
 from video_fetcher.config import Settings
 from video_fetcher.models import SnapAnyPost
-from video_fetcher.sites import douyin, weixin, youtube
+from video_fetcher.sites import bilibili, douyin, weixin, youtube
 
 Handler = Callable[[SnapAnyPost, Settings], Path]
 
 _HANDLERS: dict[str, Handler] = {
+    "bilibili": bilibili.download_post,
     "douyin": douyin.download_post,
     "youtube": youtube.download_post,
     "weixin": weixin.download_post,
