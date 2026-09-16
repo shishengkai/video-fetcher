@@ -7,25 +7,18 @@ from video_fetcher.config import Settings
 from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.ffmpeg_merge import merge_av_copy
 from video_fetcher.manifest import build_manifest, write_manifest
+from video_fetcher.models import Media, SnapAnyPost, Subtitle, first_present
 from video_fetcher.paths import extension_from_url, post_dir
 from video_fetcher.quality import pick_audio_variant, pick_variant_by_quality
 
 
-def download_post(post: dict[str, Any], settings: Settings) -> Path:
-    site = _require_str(post, "site")
-    post_url = _require_str(post, "post_url")
-    post_id = _require_str(post, "id")
+def download_post(post: SnapAnyPost, settings: Settings) -> Path:
+    site = post.site
+    post_url = post.post_url
+    post_id = post.require_api_id()
 
-    medias = post.get("medias")
-    if not isinstance(medias, list) or not medias:
-        raise ValueError("YouTube 结果缺少 medias 数组。")
-
-    video_media = next(
-        (m for m in medias if isinstance(m, dict) and m.get("media_type") == "video"),
-        None,
-    )
-    if video_media is None:
-        raise ValueError("YouTube 结果中未找到 media_type=video 的项。")
+    post.require_medias(site_label="YouTube")
+    video_media = post.require_video_media(site_label="YouTube")
 
     variant = _pick_video_variant(video_media)
     video_url = variant.get("video_url")
@@ -51,7 +44,7 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     audio_ext = audio_pick[1] if audio_pick else None
     expected_audio = audio_pick[2] if audio_pick else None
 
-    headers = video_media.get("headers") if isinstance(video_media.get("headers"), dict) else {}
+    headers = video_media.headers
 
     out = post_dir(settings, site, post_id)
     video_name = f"{site}-{post_id}.{video_ext}"
@@ -83,14 +76,14 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
         )
 
     preview_name: str | None = None
-    preview_url = video_media.get("preview_url")
-    if isinstance(preview_url, str) and preview_url.strip():
+    if video_media.preview_url and video_media.preview_url.strip():
+        preview_url = video_media.preview_url.strip()
         cover_ext = extension_from_url(preview_url, default="jpg")
         preview_name = f"{site}-{post_id}.{cover_ext}"
         jobs.append(
             DownloadJob(
                 key="preview",
-                url=preview_url.strip(),
+                url=preview_url,
                 dest=out / preview_name,
                 headers=headers,
                 required=False,
@@ -111,7 +104,6 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
             )
         )
 
-    # 直链短时有效：视频/音频/封面/字幕尽量同一时刻开始拉取
     results = download_parallel(jobs)
 
     if has_separate_audio and audio_path is not None:
@@ -134,20 +126,15 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     preview_file = preview_name if results.get("preview") is not None else None
     subtitles_file = sub_name if results.get("subtitles") is not None else None
 
-    duration = _first_present(post.get("duration"), video_media.get("duration"), variant.get("duration"))
-    created_at = post.get("created_at")
-    if created_at is not None and not isinstance(created_at, (str, int, float)):
-        created_at = str(created_at)
-
     write_manifest(
         out,
         build_manifest(
             site=site,
             id=post_id,
-            title=post.get("title") if isinstance(post.get("title"), str) else None,
-            text=post.get("text") if isinstance(post.get("text"), str) else None,
-            created_at=created_at,
-            duration=duration,
+            title=post.title,
+            text=post.text,
+            created_at=post.manifest_created_at(),
+            duration=first_present(post.duration, video_media.duration, variant.get("duration")),
             post_url=post_url,
             preview_file=preview_file,
             video_file=video_name,
@@ -157,12 +144,11 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     return out
 
 
-def _pick_video_variant(video_media: dict[str, Any]) -> dict[str, Any]:
-    variants = video_media.get("variants")
-    if not isinstance(variants, list) or not variants:
+def _pick_video_variant(video_media: Media) -> dict[str, Any]:
+    if not video_media.variants:
         raise ValueError("YouTube video 媒体缺少 variants，无法按 quality 选取。")
     try:
-        variant, _reason = pick_variant_by_quality(variants)
+        variant, _reason = pick_variant_by_quality(video_media.variants)
     except ValueError as exc:
         raise ValueError(f"YouTube 视频变体选取失败：{exc}") from exc
     return variant
@@ -170,30 +156,19 @@ def _pick_video_variant(video_media: dict[str, Any]) -> dict[str, Any]:
 
 def _resolve_separate_audio(
     *,
-    post: dict[str, Any],
+    post: SnapAnyPost,
     video_variant: dict[str, Any],
 ) -> tuple[str, str, int | None] | None:
-    """独立音频：优先 Original；无则回退。无独立轨则返回 None（合成流）。
+    """独立音频：优先 Original；无则回退。无独立轨则返回 None（合成流）。"""
+    audio_media = post.media_by_type("audio")
+    if audio_media is not None and audio_media.variants:
+        try:
+            picked, _reason = pick_audio_variant(audio_media.variants)
+        except ValueError:
+            picked = None
+        if picked is not None:
+            return _audio_fields_from_variant(picked)
 
-    返回 (audio_url, audio_ext, expected_filesize|None)。
-    """
-    medias = post.get("medias")
-    if isinstance(medias, list):
-        audio_media = next(
-            (m for m in medias if isinstance(m, dict) and m.get("media_type") == "audio"),
-            None,
-        )
-        if audio_media is not None:
-            variants = audio_media.get("variants")
-            if isinstance(variants, list) and variants:
-                try:
-                    picked, _reason = pick_audio_variant(variants)
-                except ValueError:
-                    picked = None
-                if picked is not None:
-                    return _audio_fields_from_variant(picked)
-
-    # 无可用 audio 媒体时：回退到所选视频变体上的 audio_url（若有）
     return _audio_fields_from_variant(video_variant)
 
 
@@ -216,73 +191,51 @@ def _audio_fields_from_variant(
 
 def _resolve_srt_url(
     *,
-    post: dict[str, Any],
-    video_media: dict[str, Any],
+    post: SnapAnyPost,
+    video_media: Media,
     variant: dict[str, Any],
 ) -> str | None:
     target_lang = _resolve_target_language_tag(post, variant)
     if not target_lang:
         return None
-
-    subtitles = video_media.get("subtitles")
-    if not isinstance(subtitles, list) or not subtitles:
+    if not video_media.subtitles:
         return None
 
-    matched = _match_subtitle_entry(subtitles, target_lang)
+    matched = _match_subtitle_entry(video_media.subtitles, target_lang)
     if matched is None:
         return None
 
-    urls = matched.get("urls")
-    if not isinstance(urls, list):
-        return None
-    for item in urls:
-        if isinstance(item, dict) and item.get("format") == "srt":
-            raw = item.get("url")
-            if isinstance(raw, str) and raw.strip():
-                return raw.strip()
+    for item in matched.urls:
+        if item.format == "srt" and item.url and item.url.strip():
+            return item.url.strip()
     return None
 
 
-def _resolve_target_language_tag(post: dict[str, Any], variant: dict[str, Any]) -> str | None:
+def _resolve_target_language_tag(post: SnapAnyPost, variant: dict[str, Any]) -> str | None:
     tag = variant.get("language_tag")
     if isinstance(tag, str) and tag.strip():
         return tag.strip()
 
-    medias = post.get("medias")
-    if not isinstance(medias, list):
-        return None
-    audio_media = next(
-        (m for m in medias if isinstance(m, dict) and m.get("media_type") == "audio"),
-        None,
-    )
+    audio_media = post.media_by_type("audio")
     if audio_media is None:
         return None
-    variants = audio_media.get("variants")
-    if not isinstance(variants, list):
-        return None
-    for item in variants:
-        if isinstance(item, dict) and item.get("is_default") is True:
-            t = item.get("language_tag")
-            if isinstance(t, str) and t.strip():
-                return t.strip()
+    for item in audio_media.variants:
+        if item.is_default is True and item.language_tag and item.language_tag.strip():
+            return item.language_tag.strip()
     return None
 
 
-def _match_subtitle_entry(subtitles: list[Any], target_lang: str) -> dict[str, Any] | None:
+def _match_subtitle_entry(subtitles: list[Subtitle], target_lang: str) -> Subtitle | None:
     target_norm = target_lang.strip().lower()
     target_primary = _primary_lang(target_norm)
 
     for item in subtitles:
-        if not isinstance(item, dict):
-            continue
-        tag = item.get("language_tag")
+        tag = item.language_tag
         if isinstance(tag, str) and tag.strip().lower() == target_norm:
             return item
 
     for item in subtitles:
-        if not isinstance(item, dict):
-            continue
-        tag = item.get("language_tag")
+        tag = item.language_tag
         if isinstance(tag, str) and _primary_lang(tag) == target_primary:
             return item
     return None
@@ -291,20 +244,3 @@ def _match_subtitle_entry(subtitles: list[Any], target_lang: str) -> dict[str, A
 def _primary_lang(tag: str) -> str:
     text = tag.strip().lower().replace("_", "-")
     return text.split("-", 1)[0]
-
-
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        return value
-    return None
-
-
-def _require_str(data: dict[str, Any], key: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"YouTube 结果缺少或无效字段 {key!r}。顶层键={list(data.keys())}")
-    return value.strip()

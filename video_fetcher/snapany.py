@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
-import requests
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+from video_fetcher.http import get_session
 
 SNAPANY_EXTRACT_URL = "https://api.snapany.com/openapi/v1/extract/post"
 DEFAULT_MAX_ATTEMPTS = 3
@@ -19,27 +20,27 @@ def extract_post(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
 ) -> dict[str, Any]:
-    """调用 SnapAny extract/post；失败最多重试 max_attempts 次后抛出完整错误含义。"""
+    """调用 SnapAny extract/post；失败由 tenacity 重试后抛出完整错误含义。"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept-Language": "zh",
         "Content-Type": "application/json",
     }
-    last_error: Exception | None = None
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return _extract_once(url, headers=headers, timeout=timeout)
-        except Exception as exc:  # noqa: BLE001 — 统一重试网络与 API 业务失败
-            last_error = exc
-            if attempt >= max_attempts:
-                break
-            time.sleep(retry_delay_sec)
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_fixed(retry_delay_sec),
+    )
+    def _attempt() -> dict[str, Any]:
+        return _extract_once(url, headers=headers, timeout=timeout)
 
-    assert last_error is not None
-    raise RuntimeError(
-        f"SnapAny 提取失败（已重试 {max_attempts} 次）：\n{last_error}"
-    ) from last_error
+    try:
+        return _attempt()
+    except Exception as exc:  # noqa: BLE001 — 统一包装重试耗尽
+        raise RuntimeError(
+            f"SnapAny 提取失败（已重试 {max_attempts} 次）：\n{exc}"
+        ) from exc
 
 
 def _extract_once(
@@ -48,14 +49,15 @@ def _extract_once(
     headers: dict[str, str],
     timeout: float,
 ) -> dict[str, Any]:
+    session = get_session()
     try:
-        response = requests.post(
+        response = session.post(
             SNAPANY_EXTRACT_URL,
             headers=headers,
             json={"url": url},
             timeout=timeout,
         )
-    except requests.RequestException as exc:
+    except Exception as exc:  # noqa: BLE001 — 交 tenacity / Session 重试
         raise RuntimeError(f"SnapAny 请求失败（网络错误）: {exc}") from exc
 
     body_text = response.text

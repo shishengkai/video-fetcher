@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
 from pathlib import Path
 
 from video_fetcher.config import Settings
+from video_fetcher.models import SnapAnyPost
 from video_fetcher.sites import douyin, weixin, youtube
 
-Handler = Callable[[dict[str, Any], Settings], Path]
+Handler = Callable[[SnapAnyPost, Settings], Path]
 
 _HANDLERS: dict[str, Handler] = {
     "douyin": douyin.download_post,

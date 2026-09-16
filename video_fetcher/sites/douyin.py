@@ -1,33 +1,25 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from video_fetcher.config import Settings
 from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.manifest import build_manifest, write_manifest
+from video_fetcher.models import Media, SnapAnyPost, first_present
 from video_fetcher.paths import extension_from_url, id_from_post_url, post_dir
 from video_fetcher.quality import pick_variant_by_quality
 
 
-def download_post(post: dict[str, Any], settings: Settings) -> Path:
-    site = _require_str(post, "site")
-    post_url = _require_str(post, "post_url")
-    dir_id, api_id = _resolve_post_id(post, post_url)
+def download_post(post: SnapAnyPost, settings: Settings) -> Path:
+    site = post.site
+    post_url = post.post_url
+    dir_id, api_id = _resolve_post_id(post)
 
-    medias = post.get("medias")
-    if not isinstance(medias, list) or not medias:
-        raise ValueError("抖音结果缺少 medias 数组。")
-
-    video_media = next(
-        (m for m in medias if isinstance(m, dict) and m.get("media_type") == "video"),
-        None,
-    )
-    if video_media is None:
-        raise ValueError("抖音结果中未找到 media_type=video 的项。")
+    post.require_medias(site_label="抖音")
+    video_media = post.require_video_media(site_label="抖音")
 
     video_url, video_ext, video_filesize, _pick_reason = _resolve_video_source(video_media)
-    headers = video_media.get("headers") if isinstance(video_media.get("headers"), dict) else {}
+    headers = video_media.headers
 
     out = post_dir(settings, site, dir_id)
     video_name = f"{site}-{dir_id}.{video_ext}"
@@ -46,14 +38,14 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     ]
 
     preview_name: str | None = None
-    preview_url = video_media.get("preview_url")
-    if isinstance(preview_url, str) and preview_url.strip():
+    if video_media.preview_url and video_media.preview_url.strip():
+        preview_url = video_media.preview_url.strip()
         cover_ext = extension_from_url(preview_url, default="jpg")
         preview_name = f"{site}-{dir_id}.{cover_ext}"
         jobs.append(
             DownloadJob(
                 key="preview",
-                url=preview_url.strip(),
+                url=preview_url,
                 dest=out / preview_name,
                 headers=headers,
                 required=False,
@@ -63,20 +55,15 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     results = download_parallel(jobs)
     preview_file = preview_name if results.get("preview") is not None else None
 
-    duration = _first_present(post.get("duration"), video_media.get("duration"))
-    created_at = post.get("created_at")
-    if created_at is not None and not isinstance(created_at, (str, int, float)):
-        created_at = str(created_at)
-
     write_manifest(
         out,
         build_manifest(
             site=site,
             id=api_id,
-            title=post.get("title") if isinstance(post.get("title"), str) else None,
-            text=post.get("text") if isinstance(post.get("text"), str) else None,
-            created_at=created_at,
-            duration=duration,
+            title=post.title,
+            text=post.text,
+            created_at=post.manifest_created_at(),
+            duration=first_present(post.duration, video_media.duration),
             post_url=post_url,
             preview_file=preview_file,
             video_file=video_name,
@@ -86,44 +73,25 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     return out
 
 
-def _resolve_post_id(post: dict[str, Any], post_url: str) -> tuple[str, str | None]:
-    """返回 (目录用 id, manifest 用真 id|None)。
-
-    仅接口返回的 id 写入 manifest；由 post_url 回退造出的 id 只用于目录名。
-    """
-    raw = post.get("id")
-    if isinstance(raw, str) and raw.strip():
-        value = raw.strip()
-        return value, value
-    if raw is not None and not isinstance(raw, str):
-        text = str(raw).strip()
-        if text:
-            return text, text
-    return id_from_post_url(post_url), None
-
-
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        return value
-    return None
+def _resolve_post_id(post: SnapAnyPost) -> tuple[str, str | None]:
+    """返回 (目录用 id, manifest 用真 id|None)。"""
+    api_id = post.api_id()
+    if api_id:
+        return api_id, api_id
+    return id_from_post_url(post.post_url), None
 
 
 def _resolve_video_source(
-    video_media: dict[str, Any],
+    video_media: Media,
 ) -> tuple[str, str, int | None, str]:
     """返回 (video_url, video_ext, video_filesize|None, pick_reason)。
 
     优先级：按 ≤1080 最大 / >1080 最小选 variants → resource_url。
     变体缺 ext / filesize 时软回退；变体不可用时再回退 resource_url。
     """
-    variants = video_media.get("variants")
-    if isinstance(variants, list) and variants:
+    if video_media.variants:
         try:
-            variant, pick_reason = pick_variant_by_quality(variants)
+            variant, pick_reason = pick_variant_by_quality(video_media.variants)
         except ValueError as exc:
             resource = _resource_url_fallback(video_media, why=f"variants 不可用（{exc}）")
             if resource is not None:
@@ -140,7 +108,6 @@ def _resolve_video_source(
                 video_ext = extension_from_url(video_url, default="mp4")
                 pick_reason = f"{pick_reason}；缺 video_ext，已从 URL 推断为 {video_ext!r}"
 
-            filesize: int | None
             filesize_raw = variant.get("video_filesize")
             if filesize_raw is None:
                 filesize = None
@@ -166,12 +133,12 @@ def _resolve_video_source(
 
 
 def _resource_url_fallback(
-    video_media: dict[str, Any],
+    video_media: Media,
     *,
     why: str,
 ) -> tuple[str, str, int | None, str] | None:
-    resource_url = video_media.get("resource_url")
-    if not isinstance(resource_url, str) or not resource_url.strip():
+    resource_url = video_media.resource_url
+    if not resource_url or not resource_url.strip():
         return None
     ext = extension_from_url(resource_url, default="mp4")
     return (
@@ -180,10 +147,3 @@ def _resource_url_fallback(
         None,
         f"{why}，回退 resource_url（跳过 filesize 校验）",
     )
-
-
-def _require_str(data: dict[str, Any], key: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"抖音结果缺少或无效字段 {key!r}。顶层键={list(data.keys())}")
-    return value.strip()

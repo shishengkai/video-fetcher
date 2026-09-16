@@ -9,6 +9,16 @@ PREFERRED_MAX_QUALITY = 1080
 _ORIGINAL_LABELS = frozenset({"original", "origianl"})  # 含常见拼写
 
 
+def _as_dict(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        return item
+    dump = getattr(item, "model_dump", None)
+    if callable(dump):
+        data = dump()
+        return data if isinstance(data, dict) else None
+    return None
+
+
 def parse_quality(item: dict[str, Any]) -> int | None:
     raw = item.get("quality")
     try:
@@ -43,8 +53,9 @@ def pick_variant_by_quality(variants: list[Any]) -> tuple[dict[str, Any], str]:
 
     仅用于视频轨选取，不用于独立音频。
     返回 (variant, pick_reason)。无可用 quality 数值时抛出 ValueError。
+    接受 dict 或带 model_dump 的模型对象。
     """
-    dict_variants = [v for v in variants if isinstance(v, dict)]
+    dict_variants = [d for d in (_as_dict(v) for v in variants) if d is not None]
     if not dict_variants:
         raise ValueError("variants 中没有任何对象项")
 
@@ -88,7 +99,7 @@ def pick_audio_variant(variants: list[Any]) -> tuple[dict[str, Any], str]:
     2. is_default=true 且有 audio_url
     3. 第一条带 audio_url 的变体
     """
-    dict_variants = [v for v in variants if isinstance(v, dict)]
+    dict_variants = [d for d in (_as_dict(v) for v in variants) if d is not None]
     if not dict_variants:
         raise ValueError("音频 variants 中没有任何对象项")
 

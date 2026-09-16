@@ -6,9 +6,16 @@ from pathlib import Path
 from typing import Mapping
 
 import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+
+from video_fetcher.http import get_session
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_TIMEOUT = 120.0
+
+
+class DownloadSizeError(RuntimeError):
+    """下载完成但字节数与期望不符，可重试。"""
 
 
 @dataclass(frozen=True)
@@ -37,52 +44,68 @@ def download_file(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> Path:
-    """下载到 dest；可选按字节数校验，失败最多重试 max_attempts 次。
-
-    若仍失败：抛出最后一次错误（调用方可决定跳过或中止）。
-    """
+    """下载到 dest；可选按字节数校验。网络错误与体积不符由 tenacity 重试。"""
     if not url:
         raise ValueError("下载 URL 为空。")
 
     req_headers = dict(headers or {})
-    last_error: Exception | None = None
+    session = get_session()
 
-    for attempt in range(1, max_attempts + 1):
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_fixed(0.5),
+        retry=retry_if_exception_type((requests.RequestException, DownloadSizeError, OSError)),
+    )
+    def _attempt() -> Path:
         try:
-            with requests.get(
+            return _download_once(
+                session,
                 url,
+                dest,
                 headers=req_headers,
-                stream=True,
+                expected_size=expected_size,
                 timeout=timeout,
-            ) as response:
-                response.raise_for_status()
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with dest.open("wb") as fh:
-                    for chunk in response.iter_content(1 << 20):
-                        if chunk:
-                            fh.write(chunk)
-
-            actual = dest.stat().st_size
-            if expected_size is not None and actual != int(expected_size):
-                raise RuntimeError(
-                    f"下载大小校验失败（第 {attempt}/{max_attempts} 次）："
-                    f"期望 {expected_size} 字节，实际 {actual} 字节；文件={dest}"
-                )
-            return dest
-        except Exception as exc:  # noqa: BLE001 — 汇总重试
-            last_error = exc
+            )
+        except Exception:
             if dest.exists():
                 try:
                     dest.unlink()
                 except OSError:
                     pass
-            if attempt >= max_attempts:
-                break
+            raise
 
-    assert last_error is not None
-    raise RuntimeError(
-        f"下载失败（已重试 {max_attempts} 次）: {url}\n{last_error}"
-    ) from last_error
+    try:
+        return _attempt()
+    except Exception as exc:  # noqa: BLE001 — 统一包装重试耗尽
+        raise RuntimeError(
+            f"下载失败（已重试 {max_attempts} 次）: {url}\n{exc}"
+        ) from exc
+
+
+def _download_once(
+    session: requests.Session,
+    url: str,
+    dest: Path,
+    *,
+    headers: dict[str, str],
+    expected_size: int | None,
+    timeout: float,
+) -> Path:
+    with session.get(url, headers=headers, stream=True, timeout=timeout) as response:
+        response.raise_for_status()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as fh:
+            for chunk in response.iter_content(1 << 20):
+                if chunk:
+                    fh.write(chunk)
+
+    actual = dest.stat().st_size
+    if expected_size is not None and actual != int(expected_size):
+        raise DownloadSizeError(
+            f"下载大小校验失败：期望 {expected_size} 字节，实际 {actual} 字节；文件={dest}"
+        )
+    return dest
 
 
 def download_parallel(

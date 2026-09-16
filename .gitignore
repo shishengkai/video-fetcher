@@ -23,3 +23,7 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local E2E leftovers
+*.log
+run_douyin_e2e.sh
