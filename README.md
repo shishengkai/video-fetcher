@@ -39,5 +39,6 @@ python -m video_fetcher 'https://v.douyin.com/xxxx/'
 | `youtube` | 已实现（视频 ≤1080；音频优先 Original 再回退；同帖媒体并行下载；分离轨则 ffmpeg 合并；字幕语言回退） |
 | `weixin` | 已实现（`resource_url` + 封面；目录 id 取自 `post_url`；同帖媒体并行下载） |
 | `bilibili` | 已实现（仅 `resource_url`；BV id 取自 `post_url` 末节并写入 manifest；headers 可选；同帖并行） |
+| （其它 site） | **通用回退**：先 `resource_url`，再 variants≤1080（分离音轨则合并）；无 video 则下图片；有 headers 则带上 |
 
 项目规范与设计见配套 brain：`video-fetcher-brain`。
