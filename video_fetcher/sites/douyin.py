@@ -1,23 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from video_fetcher.config import Settings
 from video_fetcher.download import download_file
+from video_fetcher.manifest import build_manifest, write_manifest
 from video_fetcher.paths import extension_from_url, id_from_post_url, post_dir
 
-_CST = timezone(timedelta(hours=8))
 _ORIGINAL_LABELS = {"original", "origianl"}  # 含设想稿中的拼写
 
 
 def download_post(post: dict[str, Any], settings: Settings) -> Path:
     site = _require_str(post, "site")
     post_url = _require_str(post, "post_url")
-    post_id = _resolve_post_id(post, post_url)
-    text = post.get("text") if isinstance(post.get("text"), str) else ""
-    created_at_raw = post.get("created_at")
+    dir_id, api_id = _resolve_post_id(post, post_url)
 
     medias = post.get("medias")
     if not isinstance(medias, list) or not medias:
@@ -30,15 +27,12 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     if video_media is None:
         raise ValueError("抖音结果中未找到 media_type=video 的项。")
 
-    video_url, video_ext, video_filesize, pick_reason = _resolve_video_source(video_media)
-
+    video_url, video_ext, video_filesize, _pick_reason = _resolve_video_source(video_media)
     headers = video_media.get("headers") if isinstance(video_media.get("headers"), dict) else {}
 
-    out = post_dir(settings, site, post_id)
-    video_name = f"{site}-{post_id}.{video_ext}"
-    info_name = f"{site}-{post_id}.md"
+    out = post_dir(settings, site, dir_id)
+    video_name = f"{site}-{dir_id}.{video_ext}"
     video_path = out / video_name
-    info_path = out / info_name
 
     expected = int(video_filesize) if video_filesize is not None else None
     download_file(
@@ -48,51 +42,64 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
         expected_size=expected,
     )
 
-    cover_name: str | None = None
-    cover_ok = False
-    cover_error = ""
+    preview_file: str | None = None
     preview_url = video_media.get("preview_url")
     if isinstance(preview_url, str) and preview_url.strip():
         cover_ext = extension_from_url(preview_url, default="jpg")
-        cover_name = f"{site}-{post_id}.{cover_ext}"
-        cover_path = out / cover_name
+        cover_name = f"{site}-{dir_id}.{cover_ext}"
         try:
-            download_file(preview_url.strip(), cover_path, headers=headers)
-            cover_ok = True
-        except Exception as exc:  # noqa: BLE001
-            cover_error = str(exc)
-            cover_name = None
-    else:
-        cover_error = "缺少 preview_url，已跳过封面"
+            download_file(preview_url.strip(), out / cover_name, headers=headers)
+            preview_file = cover_name
+        except Exception:
+            preview_file = None
 
-    published = _format_beijing_time(created_at_raw)
-    info_path.write_text(
-        _render_info_md(
+    duration = _first_present(post.get("duration"), video_media.get("duration"))
+    created_at = post.get("created_at")
+    if created_at is not None and not isinstance(created_at, (str, int, float)):
+        created_at = str(created_at)
+
+    write_manifest(
+        out,
+        build_manifest(
             site=site,
-            post_id=post_id,
-            text=text,
-            published=published,
+            id=api_id,
+            title=post.get("title") if isinstance(post.get("title"), str) else None,
+            text=post.get("text") if isinstance(post.get("text"), str) else None,
+            created_at=created_at,
+            duration=duration,
             post_url=post_url,
-            cover_name=cover_name if cover_ok else None,
-            video_name=video_name,
-            cover_error=cover_error,
-            pick_reason=pick_reason,
+            preview_file=preview_file,
+            video_file=video_name,
+            subtitles_file=None,
         ),
-        encoding="utf-8",
     )
     return out
 
 
-def _resolve_post_id(post: dict[str, Any], post_url: str) -> str:
+def _resolve_post_id(post: dict[str, Any], post_url: str) -> tuple[str, str | None]:
+    """返回 (目录用 id, manifest 用真 id|None)。
+
+    仅接口返回的 id 写入 manifest；由 post_url 回退造出的 id 只用于目录名。
+    """
     raw = post.get("id")
     if isinstance(raw, str) and raw.strip():
-        return raw.strip()
+        value = raw.strip()
+        return value, value
     if raw is not None and not isinstance(raw, str):
-        # 偶发数字 id
         text = str(raw).strip()
         if text:
-            return text
-    return id_from_post_url(post_url)
+            return text, text
+    return id_from_post_url(post_url), None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
 
 
 def _resolve_video_source(
@@ -206,51 +213,6 @@ def _variants_summary(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for v in variants
     ]
-
-
-def _format_beijing_time(raw: Any) -> str:
-    if raw is None or raw == "":
-        return "（无 created_at）"
-    try:
-        ts = int(str(raw).strip())
-    except ValueError as exc:
-        raise ValueError(f"created_at 不是可解析的时间戳: {raw!r}") from exc
-    return datetime.fromtimestamp(ts, tz=_CST).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _render_info_md(
-    *,
-    site: str,
-    post_id: str,
-    text: str,
-    published: str,
-    post_url: str,
-    cover_name: str | None,
-    video_name: str,
-    cover_error: str,
-    pick_reason: str,
-) -> str:
-    cover_line = (
-        f"[封面](./{cover_name})"
-        if cover_name
-        else f"（封面未保存）{cover_error}"
-    )
-    return (
-        f"# {site}-{post_id}\n\n"
-        f"## 描述\n\n"
-        f"{text}\n\n"
-        f"## 发布时间\n\n"
-        f"{published}\n\n"
-        f"## 源链接\n\n"
-        f"{post_url}\n\n"
-        f"## id\n\n"
-        f"{site} {post_id}\n\n"
-        f"## 下载选取\n\n"
-        f"{pick_reason}\n\n"
-        f"## 下载结果\n\n"
-        f"{cover_line}\n\n"
-        f"[视频](./{video_name})\n"
-    )
 
 
 def _require_str(data: dict[str, Any], key: str) -> str:
