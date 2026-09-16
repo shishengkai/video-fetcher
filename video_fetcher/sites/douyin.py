@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from video_fetcher.config import Settings
-from video_fetcher.download import download_file
+from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.manifest import build_manifest, write_manifest
 from video_fetcher.paths import extension_from_url, id_from_post_url, post_dir
 
@@ -35,23 +35,34 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     video_path = out / video_name
 
     expected = int(video_filesize) if video_filesize is not None else None
-    download_file(
-        video_url,
-        video_path,
-        headers=headers,
-        expected_size=expected,
-    )
+    jobs = [
+        DownloadJob(
+            key="video",
+            url=video_url,
+            dest=video_path,
+            headers=headers,
+            expected_size=expected,
+            required=True,
+        )
+    ]
 
-    preview_file: str | None = None
+    preview_name: str | None = None
     preview_url = video_media.get("preview_url")
     if isinstance(preview_url, str) and preview_url.strip():
         cover_ext = extension_from_url(preview_url, default="jpg")
-        cover_name = f"{site}-{dir_id}.{cover_ext}"
-        try:
-            download_file(preview_url.strip(), out / cover_name, headers=headers)
-            preview_file = cover_name
-        except Exception:
-            preview_file = None
+        preview_name = f"{site}-{dir_id}.{cover_ext}"
+        jobs.append(
+            DownloadJob(
+                key="preview",
+                url=preview_url.strip(),
+                dest=out / preview_name,
+                headers=headers,
+                required=False,
+            )
+        )
+
+    results = download_parallel(jobs)
+    preview_file = preview_name if results.get("preview") is not None else None
 
     duration = _first_present(post.get("duration"), video_media.get("duration"))
     created_at = post.get("created_at")

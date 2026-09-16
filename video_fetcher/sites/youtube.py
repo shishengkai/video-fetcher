@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from video_fetcher.config import Settings
-from video_fetcher.download import download_file
+from video_fetcher.download import DownloadJob, download_parallel
 from video_fetcher.ffmpeg_merge import merge_av_copy
 from video_fetcher.manifest import build_manifest, write_manifest
 from video_fetcher.paths import extension_from_url, post_dir
@@ -44,9 +44,9 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     video_filesize = variant.get("video_filesize")
     expected_video = int(video_filesize) if video_filesize is not None else None
 
-    audio_url = variant.get("audio_url")
-    has_separate_audio = isinstance(audio_url, str) and bool(audio_url.strip())
-    audio_url = audio_url.strip() if has_separate_audio else None
+    audio_url_raw = variant.get("audio_url")
+    has_separate_audio = isinstance(audio_url_raw, str) and bool(audio_url_raw.strip())
+    audio_url = audio_url_raw.strip() if has_separate_audio else None
 
     headers = video_media.get("headers") if isinstance(video_media.get("headers"), dict) else {}
 
@@ -54,16 +54,19 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
     video_name = f"{site}-{post_id}.{video_ext}"
     video_path = out / video_name
 
-    # 视频：失败重试后仍失败则抛错（成片核心）
-    download_file(
-        video_url,
-        video_path,
-        headers=headers,
-        expected_size=expected_video,
-    )
+    jobs: list[DownloadJob] = [
+        DownloadJob(
+            key="video",
+            url=video_url,
+            dest=video_path,
+            headers=headers,
+            expected_size=expected_video,
+            required=True,
+        )
+    ]
 
-    if has_separate_audio:
-        assert audio_url is not None
+    audio_path: Path | None = None
+    if has_separate_audio and audio_url is not None:
         audio_ext = variant.get("audio_ext")
         if not isinstance(audio_ext, str) or not audio_ext.strip():
             audio_ext = extension_from_url(audio_url, default="m4a")
@@ -72,12 +75,50 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
         audio_filesize = variant.get("audio_filesize")
         expected_audio = int(audio_filesize) if audio_filesize is not None else None
         audio_path = out / f"{site}-{post_id}.{audio_ext}"
-        download_file(
-            audio_url,
-            audio_path,
-            headers=headers,
-            expected_size=expected_audio,
+        jobs.append(
+            DownloadJob(
+                key="audio",
+                url=audio_url,
+                dest=audio_path,
+                headers=headers,
+                expected_size=expected_audio,
+                required=True,
+            )
         )
+
+    preview_name: str | None = None
+    preview_url = video_media.get("preview_url")
+    if isinstance(preview_url, str) and preview_url.strip():
+        cover_ext = extension_from_url(preview_url, default="jpg")
+        preview_name = f"{site}-{post_id}.{cover_ext}"
+        jobs.append(
+            DownloadJob(
+                key="preview",
+                url=preview_url.strip(),
+                dest=out / preview_name,
+                headers=headers,
+                required=False,
+            )
+        )
+
+    sub_name: str | None = None
+    srt_url = _resolve_srt_url(post=post, video_media=video_media, variant=variant)
+    if srt_url:
+        sub_name = f"{site}-{post_id}.srt"
+        jobs.append(
+            DownloadJob(
+                key="subtitles",
+                url=srt_url,
+                dest=out / sub_name,
+                headers=headers,
+                required=False,
+            )
+        )
+
+    # 直链短时有效：视频/音频/封面/字幕尽量同一时刻开始拉取
+    results = download_parallel(jobs)
+
+    if has_separate_audio and audio_path is not None:
         merged_tmp = out / f"{site}-{post_id}.merged.{video_ext}"
         try:
             merge_av_copy(video_path, audio_path, merged_tmp)
@@ -94,23 +135,8 @@ def download_post(post: dict[str, Any], settings: Settings) -> Path:
                 except OSError:
                     pass
 
-    preview_file = _try_download_preview(
-        video_media,
-        out=out,
-        site=site,
-        post_id=post_id,
-        headers=headers,
-    )
-
-    subtitles_file = _try_download_subtitles(
-        post=post,
-        video_media=video_media,
-        variant=variant,
-        out=out,
-        site=site,
-        post_id=post_id,
-        headers=headers,
-    )
+    preview_file = preview_name if results.get("preview") is not None else None
+    subtitles_file = sub_name if results.get("subtitles") is not None else None
 
     duration = _first_present(post.get("duration"), video_media.get("duration"), variant.get("duration"))
     created_at = post.get("created_at")
@@ -159,35 +185,11 @@ def _pick_max_quality_variant(video_media: dict[str, Any]) -> dict[str, Any]:
     return best
 
 
-def _try_download_preview(
-    video_media: dict[str, Any],
-    *,
-    out: Path,
-    site: str,
-    post_id: str,
-    headers: dict[str, Any],
-) -> str | None:
-    preview_url = video_media.get("preview_url")
-    if not isinstance(preview_url, str) or not preview_url.strip():
-        return None
-    cover_ext = extension_from_url(preview_url, default="jpg")
-    cover_name = f"{site}-{post_id}.{cover_ext}"
-    try:
-        download_file(preview_url.strip(), out / cover_name, headers=headers)
-        return cover_name
-    except Exception:
-        return None
-
-
-def _try_download_subtitles(
+def _resolve_srt_url(
     *,
     post: dict[str, Any],
     video_media: dict[str, Any],
     variant: dict[str, Any],
-    out: Path,
-    site: str,
-    post_id: str,
-    headers: dict[str, Any],
 ) -> str | None:
     target_lang = _resolve_target_language_tag(post, variant)
     if not target_lang:
@@ -204,22 +206,12 @@ def _try_download_subtitles(
     urls = matched.get("urls")
     if not isinstance(urls, list):
         return None
-    srt_url = None
     for item in urls:
         if isinstance(item, dict) and item.get("format") == "srt":
             raw = item.get("url")
             if isinstance(raw, str) and raw.strip():
-                srt_url = raw.strip()
-                break
-    if not srt_url:
-        return None
-
-    sub_name = f"{site}-{post_id}.srt"
-    try:
-        download_file(srt_url, out / sub_name, headers=headers)
-        return sub_name
-    except Exception:
-        return None
+                return raw.strip()
+    return None
 
 
 def _resolve_target_language_tag(post: dict[str, Any], variant: dict[str, Any]) -> str | None:
@@ -251,7 +243,6 @@ def _match_subtitle_entry(subtitles: list[Any], target_lang: str) -> dict[str, A
     target_norm = target_lang.strip().lower()
     target_primary = _primary_lang(target_norm)
 
-    # 1) exact
     for item in subtitles:
         if not isinstance(item, dict):
             continue
@@ -259,7 +250,6 @@ def _match_subtitle_entry(subtitles: list[Any], target_lang: str) -> dict[str, A
         if isinstance(tag, str) and tag.strip().lower() == target_norm:
             return item
 
-    # 2) primary subtag
     for item in subtitles:
         if not isinstance(item, dict):
             continue
